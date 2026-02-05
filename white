@@ -1,0 +1,99 @@
+import socket
+import struct
+import open3d as o3d
+import numpy as np
+from collections import deque
+
+# --- 設定 ---
+# 30,000点 ≒ 0.15秒分 (残像を適度に抑えた設定)
+MAX_BUFFER_SIZE = 30000 
+
+UDP_PORT = 56301
+OFFSET_HEADER = 36
+POINT_STEP = 14
+POINT_SIZE = 3.0       
+
+def parse_mid360_packet(data):
+    if len(data) <= OFFSET_HEADER:
+        return []
+
+    points_list = []
+    data_length = len(data) - OFFSET_HEADER
+    num_points = data_length // POINT_STEP
+    
+    for i in range(num_points):
+        start = OFFSET_HEADER + (i * POINT_STEP)
+        try:
+            x, y, z = struct.unpack_from('<iii', data, start)
+            if x == 0 and y == 0 and z == 0:
+                continue
+            points_list.append([x, y, z])
+        except struct.error:
+            break
+            
+    return points_list
+
+def main():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(("", UDP_PORT))
+        print(f"接続成功！ ポート {UDP_PORT}")
+        print("点群カラー: 白 (固定)")
+    except OSError:
+        print("エラー: ポートが開けません。Livox Viewerを閉じてください。")
+        return
+
+    # リングバッファ
+    point_buffer = deque(maxlen=MAX_BUFFER_SIZE)
+
+    vis = o3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(window_name="Livox White Viewer", width=960, height=720)
+    
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.array([[0,0,0]], dtype=np.float64))
+    vis.add_geometry(pcd)
+    
+    # 描画オプション
+    opt = vis.get_render_option()
+    opt.background_color = np.asarray([0, 0, 0]) # 背景は黒
+    opt.point_size = POINT_SIZE
+    
+    # ★重要: ポイントの色情報を使用する設定にする
+    opt.point_color_option = o3d.visualization.PointColorOption.Color 
+
+    vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5, origin=[0,0,0]))
+
+    frame_count = 0
+
+    try:
+        while True:
+            data, _ = sock.recvfrom(2048)
+            
+            if len(data) > 0:
+                new_points = parse_mid360_packet(data)
+                if new_points:
+                    point_buffer.extend(new_points)
+
+                frame_count += 1
+                if frame_count % 5 == 0:
+                    if len(point_buffer) > 0:
+                        points_np = np.array(point_buffer, dtype=np.float64)
+                        points_np /= 1000.0 
+                        
+                        pcd.points = o3d.utility.Vector3dVector(points_np)
+                        
+                        # ★ここが変更点: すべての点を「白 ([1, 1, 1])」で塗る
+                        pcd.paint_uniform_color([1, 1, 1])
+                        
+                        vis.update_geometry(pcd)
+                        vis.poll_events()
+                        vis.update_renderer()
+
+    except KeyboardInterrupt:
+        print("終了します")
+    finally:
+        sock.close()
+        vis.destroy_window()
+
+if __name__ == "__main__":
+    main()
