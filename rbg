@@ -1,0 +1,193 @@
+import socket
+import struct
+import open3d as o3d
+import numpy as np
+from collections import deque
+
+# --- 設定 ---
+VOXEL_SIZE = 0.1        
+MAX_BUFFER_SIZE = 50000 
+UDP_PORT = 56301
+OFFSET_HEADER = 36
+POINT_STEP = 14
+
+# --- 色分けのしきい値 ---
+# 1. 完全に平らとみなす誤差 (RANSAC用)
+FLAT_THRESHOLD = 0.05  # 5cm以内の誤差なら「緑」
+
+# 2. 凸凹（赤色）とみなす高さの上限
+# 平面からこの高さ(m)までは「凸凹（赤）」、それ以上は「障害物（青）」とします
+# さらに、XY平面上で「障害物（青）」と同じ位置にある「凸凹（赤）」も「青」に変更します。
+ROUGHNESS_HEIGHT = 0.2 # 20cm
+
+def parse_mid360_packet(data):
+    if len(data) <= OFFSET_HEADER:
+        return []
+    points_list = []
+    data_length = len(data) - OFFSET_HEADER
+    num_points = data_length // POINT_STEP
+    for i in range(num_points):
+        start = OFFSET_HEADER + (i * POINT_STEP)
+        try:
+            x, y, z = struct.unpack_from('<iii', data, start)
+            if x == 0 and y == 0 and z == 0:
+                continue
+            points_list.append([x, y, z])
+        except struct.error:
+            break
+    return points_list
+
+def main():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(("", UDP_PORT))
+        print(f"接続成功！ ポート {UDP_PORT}")
+        print(f"--- 色分けルール ---")
+        print(f"  [緑] 平面 (誤差 {FLAT_THRESHOLD*100}cm 以内)")
+        print(f"  [赤] 凸凹 (高さ {ROUGHNESS_HEIGHT*100}cm まで、かつ真上に障害物がない)")
+        print(f"  [青] 壁・障害物 (それ以上)、またはその真下の凸凹")
+    except OSError:
+        print("エラー: ポートが開けません。")
+        return
+
+    point_buffer = deque(maxlen=MAX_BUFFER_SIZE)
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="Roughness Detection Viewer", width=960, height=720)
+    
+    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5, origin=[0,0,0])
+    vis.add_geometry(axis)
+    
+    opt = vis.get_render_option()
+    opt.background_color = np.asarray([0, 0, 0]) 
+
+    dummy_pcd = o3d.geometry.PointCloud()
+    dummy_pcd.points = o3d.utility.Vector3dVector(np.array([[0,0,0]], dtype=np.float64))
+    voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(dummy_pcd, voxel_size=VOXEL_SIZE)
+    vis.add_geometry(voxel_grid)
+
+    frame_count = 0
+
+    try:
+        while True:
+            data, _ = sock.recvfrom(2048)
+            
+            if len(data) > 0:
+                new_points = parse_mid360_packet(data)
+                if new_points:
+                    point_buffer.extend(new_points)
+
+                frame_count += 1
+                
+                if frame_count % 10 == 0:
+                    if len(point_buffer) > 100:
+                        points_np = np.array(point_buffer, dtype=np.float64)
+                        points_np /= 1000.0 
+                        
+                        full_pcd = o3d.geometry.PointCloud()
+                        full_pcd.points = o3d.utility.Vector3dVector(points_np)
+                        
+                        # --- 1. 平面検出 (緑) ---
+                        plane_model, inliers = full_pcd.segment_plane(
+                            distance_threshold=FLAT_THRESHOLD,
+                            ransac_n=3,
+                            num_iterations=50 
+                        )
+                        
+                        [a, b, c, d] = plane_model
+
+                        # インライア（平面部分） -> 緑
+                        flat_pcd = full_pcd.select_by_index(inliers)
+                        flat_pcd.paint_uniform_color([0, 1, 0]) 
+
+                        # アウトライア（平面以外）
+                        outlier_pcd = full_pcd.select_by_index(inliers, invert=True)
+                        
+                        # --- 2. 残りの点と平面との距離を計算 ---
+                        if len(outlier_pcd.points) > 0:
+                            outlier_points = np.asarray(outlier_pcd.points)
+                            
+                            denom = np.sqrt(a*a + b*b + c*c)
+                            distances = np.abs(outlier_points @ np.array([a, b, c]) + d) / denom
+                            
+                            # --- 3. 凸凹 (赤候補) と 障害物 (青) の分離 ---
+                            rough_mask = distances < ROUGHNESS_HEIGHT
+                            
+                            # 赤色点群候補（凸凹）
+                            rough_indices = np.where(rough_mask)[0]
+                            rough_pcd = outlier_pcd.select_by_index(rough_indices)
+                            rough_pcd.paint_uniform_color([1, 0, 0]) # 一旦赤にする
+
+                            # 青色点群（高い障害物）
+                            obstacle_pcd = outlier_pcd.select_by_index(rough_indices, invert=True)
+                            # 【修正】白色[1,1,1]から青色[0,0,1]に変更
+                            obstacle_pcd.paint_uniform_color([0, 0, 1]) 
+
+                            # --- 4. [追加機能] 障害物の下にある赤を青に変える ---
+                            # XY平面での位置関係を見るために、点群をnumpy配列で取得
+                            obstacle_points_np = np.asarray(obstacle_pcd.points)
+                            rough_points_np = np.asarray(rough_pcd.points)
+
+                            if len(obstacle_points_np) > 0 and len(rough_points_np) > 0:
+                                # XY座標をボクセルサイズに基づくグリッドインデックスに変換
+                                def to_grid_idx(points, voxel_size):
+                                    return np.floor(points[:, :2] / voxel_size).astype(np.int32)
+
+                                obstacle_grid_indices = to_grid_idx(obstacle_points_np, VOXEL_SIZE)
+                                rough_grid_indices = to_grid_idx(rough_points_np, VOXEL_SIZE)
+
+                                # 障害物が存在するグリッドのセットを作成（高速検索用）
+                                # numpy配列の各行をタプル化してsetに格納
+                                obstacle_grid_set = set(map(tuple, obstacle_grid_indices))
+
+                                # 各凸凹点が障害物のあるグリッドに含まれるか判定
+                                is_under_obstacle = np.array([tuple(idx) in obstacle_grid_set for idx in rough_grid_indices])
+
+                                # 青に変更する点（障害物の下にある赤）のインデックスを抽出
+                                points_to_turn_blue_indices = np.where(is_under_obstacle)[0]
+                                
+                                # 該当する点を抽出し、青色に塗る
+                                pcd_to_turn_blue = rough_pcd.select_by_index(points_to_turn_blue_indices)
+                                pcd_to_turn_blue.paint_uniform_color([0, 0, 1])
+
+                                # 赤のまま残す点を抽出（インデックスを反転）
+                                rough_pcd_remaining = rough_pcd.select_by_index(points_to_turn_blue_indices, invert=True)
+                                # 念のため赤色を再適用
+                                rough_pcd_remaining.paint_uniform_color([1, 0, 0])
+
+                                # 全ての点群を結合（緑 + 残った赤 + 元の青 + 新しく青になった点）
+                                combined_pcd = flat_pcd + rough_pcd_remaining + obstacle_pcd + pcd_to_turn_blue
+                            else:
+                                # どちらかの点群が無い場合は、そのまま結合
+                                combined_pcd = flat_pcd + rough_pcd + obstacle_pcd
+                                
+                        else:
+                            combined_pcd = flat_pcd
+
+                        # ボクセル化して表示
+                        new_voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(
+                            combined_pcd, 
+                            voxel_size=VOXEL_SIZE
+                        )
+                        
+                        ctr = vis.get_view_control()
+                        cam_params = ctr.convert_to_pinhole_camera_parameters()
+                        
+                        vis.clear_geometries()
+                        vis.add_geometry(axis)
+                        vis.add_geometry(new_voxel_grid)
+                        
+                        ctr = vis.get_view_control()
+                        ctr.convert_from_pinhole_camera_parameters(cam_params)
+                        
+                        vis.poll_events()
+                        vis.update_renderer()
+
+    except KeyboardInterrupt:
+        print("\n終了します")
+    finally:
+        sock.close()
+        vis.destroy_window()
+
+if __name__ == "__main__":
+    main()
