@@ -1,0 +1,366 @@
+import socket
+import struct
+import numpy as np
+import pandas as pd
+from collections import deque
+import matplotlib.pyplot as plt
+import time
+import datetime
+import threading
+
+# Open3Dのインポート確認
+try:
+    import open3d as o3d
+    HAS_OPEN3D = True
+except ImportError:
+    HAS_OPEN3D = False
+    print("Open3Dがありません。3Dモードは使えません (pip install open3d)")
+
+# ==========================================
+#  RTF Radar System (Wide View 3D)
+#  - 3Dモード開始時にズームアウト(縮小)して全体を表示
+#  - 点群数 10万点 (遠くまで表示)
+#  - 2D: 8分割レーダー
+#  - 'v'キーで切り替え
+# ==========================================
+
+UDP_PORT = 56301
+OFFSET_HEADER = 36
+POINT_STEP = 14
+
+# --- 2Dレーダー設定 ---
+MAX_BUFFER_SIZE_2D = 50000 
+MAX_RADIUS = 5.0
+MIN_RADIUS = 0.5
+RADIUS_STEP = 0.5
+ANGLE_SECTORS = 8
+
+# --- 3D点群設定 ---
+MAX_BUFFER_SIZE_3D = 100000  # 10万点保持
+POINT_SIZE_3D = 3.0
+
+# --- 判定パラメータ (2D用) ---
+VOXEL_SIZE = 0.2 
+NOISE_FILTER_HEIGHT = 0.05
+PCA_ROUGHNESS_THRESHOLD = 0.001 
+PCA_VERTICALITY_THRESHOLD = 0.4
+WALL_HEIGHT_THRESHOLD = 1.0
+
+HEIGHT_LIMIT_MIN = -1.5 
+HEIGHT_LIMIT_MAX = 2.0
+
+# --- 色定義 ---
+COLOR_SAFE = '#a7d9ed'
+COLOR_WALL = '#ffff00'
+COLOR_DANGER = '#ff0000'
+COLOR_EMPTY = '#e0e0e0'
+COLOR_BLIND = '#808080'
+
+# --- アプリケーション状態 ---
+class AppState:
+    def __init__(self):
+        self.mode = '2D'
+        self.running = True
+        self.smoothed_scores = np.zeros(ANGLE_SECTORS)
+        self.point_buffer = deque(maxlen=MAX_BUFFER_SIZE_3D)
+        self.lock = threading.Lock()
+        self.switch_requested = False 
+
+state = AppState()
+
+def parse_mid360_packet(data):
+    if len(data) <= OFFSET_HEADER: return []
+    points_list = []
+    num_points = (len(data) - OFFSET_HEADER) // POINT_STEP
+    for i in range(num_points):
+        start = OFFSET_HEADER + (i * POINT_STEP)
+        try:
+            x, y, z = struct.unpack_from('<iii', data, start)
+            if not (x == 0 and y == 0 and z == 0):
+                points_list.append([x, y, z])
+        except struct.error: break
+    return points_list
+
+# --- 2D解析ロジック ---
+def analyze_radar_logic(points_np):
+    df = pd.DataFrame(points_np, columns=['x', 'y', 'z'])
+    df = df[(df['z'] >= HEIGHT_LIMIT_MIN) & (df['z'] <= HEIGHT_LIMIT_MAX)]
+    
+    r = np.sqrt(df['x']**2 + df['y']**2)
+    df = df[r >= MIN_RADIUS]
+    if len(df) == 0: return {}
+    
+    df['r_idx'] = np.floor((r - MIN_RADIUS) / RADIUS_STEP).astype(int)
+    theta = np.arctan2(df['y'], df['x'])
+    angle_width = 2 * np.pi / ANGLE_SECTORS
+    shifted_theta = theta + (angle_width / 2)
+    normalized_shifted = (shifted_theta + 2 * np.pi) % (2 * np.pi)
+    df['theta_idx'] = np.floor(normalized_shifted / angle_width).astype(int) % ANGLE_SECTORS
+
+    grid_status = {}
+
+    for (rid, tid), group in df.groupby(['r_idx', 'theta_idx']):
+        if MIN_RADIUS + (rid + 1) * RADIUS_STEP > MAX_RADIUS: continue
+        if len(group) < 3: continue 
+        
+        z_max = group['z'].max()
+        z_min = group['z'].min()
+        delta_z = z_max - z_min
+        
+        if delta_z < NOISE_FILTER_HEIGHT:
+            grid_status[(rid, tid)] = 0
+            continue
+
+        local_pts = group[['x', 'y', 'z']].values
+        centered = local_pts - np.mean(local_pts, axis=0)
+        cov = np.cov(centered, rowvar=False)
+        eig_val, eig_vec = np.linalg.eigh(cov)
+        
+        min_eigen = eig_val[0]
+        nz = abs(eig_vec[:, 0][2])
+        
+        is_obstacle = False
+        if min_eigen >= PCA_ROUGHNESS_THRESHOLD: is_obstacle = True
+        elif nz <= PCA_VERTICALITY_THRESHOLD: is_obstacle = True
+        if delta_z >= 0.10: is_obstacle = True
+
+        status = 0
+        if is_obstacle:
+            if delta_z >= WALL_HEIGHT_THRESHOLD:
+                status = 1 
+            else:
+                status = 2 
+        
+        if (rid, tid) in grid_status:
+            if status > grid_status[(rid, tid)]: grid_status[(rid, tid)] = status
+        else:
+            grid_status[(rid, tid)] = status
+            
+    return grid_status
+
+# --- UDP受信スレッド ---
+def udp_receiver():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try: sock.bind(("", UDP_PORT))
+    except OSError: 
+        print("ポートエラー: 別のPythonが動いていませんか？")
+        return
+
+    while state.running:
+        try:
+            data, _ = sock.recvfrom(2048)
+            if len(data) > 0:
+                new_points = parse_mid360_packet(data)
+                if new_points:
+                    with state.lock:
+                        state.point_buffer.extend(new_points)
+        except Exception: pass
+    sock.close()
+
+# --- 2Dモード ---
+def run_2d_mode():
+    print(">>> 2D Radar Mode (Press 'v' to switch to 3D) <<<")
+    
+    with state.lock:
+        current_data = list(state.point_buffer)
+        state.point_buffer = deque(current_data, maxlen=MAX_BUFFER_SIZE_2D)
+
+    plt.ion()
+    fig = plt.figure(figsize=(9, 10), facecolor='white')
+    ax = fig.add_axes([0.1, 0.1, 0.8, 0.8], projection='polar')
+    
+    def on_key(event):
+        if event.key == 'q':
+            state.running = False
+            plt.close()
+        elif event.key == 'v' and HAS_OPEN3D:
+            state.switch_requested = True
+            plt.close()
+        elif event.key == 's':
+            filename = f"radar_2d_{datetime.datetime.now().strftime('%H%M%S')}.png"
+            plt.savefig(filename)
+            print(f"Saved: {filename}")
+            
+    fig.canvas.mpl_connect('key_press_event', on_key)
+    
+    ax.set_ylim(0, MAX_RADIUS)
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+    
+    grid_radii = np.arange(MIN_RADIUS + RADIUS_STEP, MAX_RADIUS + 0.01, RADIUS_STEP)
+    ax.set_rgrids(grid_radii, angle=0, fmt='%.1f m')
+    ax.set_thetagrids([])
+    ax.set_facecolor('#f0f0f0')
+    ax.add_artist(plt.Circle((0, 0), MIN_RADIUS, transform=ax.transData._b, color=COLOR_BLIND, alpha=0.3, zorder=10))
+    
+    angle_width = 2 * np.pi / ANGLE_SECTORS
+    plot_thetas = np.array([i * angle_width for i in range(ANGLE_SECTORS)])
+    
+    bars_layers = []
+    num_rings = int((MAX_RADIUS - MIN_RADIUS) // RADIUS_STEP)
+    for rid in range(num_rings):
+        bottom_radius = MIN_RADIUS + rid * RADIUS_STEP
+        bars = ax.bar(plot_thetas, height=RADIUS_STEP, width=angle_width, bottom=bottom_radius, color=COLOR_EMPTY, edgecolor='gray', linewidth=0.5)
+        bars_layers.append(bars)
+    
+    arrow_patch = ax.annotate('', xy=(0, 0), xytext=(0, 0), arrowprops=dict(facecolor='green', shrink=0.05, width=5, headwidth=15), zorder=20)
+    
+    title_text = fig.text(0.5, 0.96, "RTF Radar (2D Mode)", ha='center', fontsize=14, fontweight='bold')
+    info_text = fig.text(0.5, 0.93, f"[v]:3D View | Red:5cm-1m | Yellow:>1m", ha='center', fontsize=10, color='gray')
+    
+    last_draw = time.perf_counter()
+    
+    while state.running and not state.switch_requested:
+        if not plt.fignum_exists(fig.number):
+            state.running = False
+            break
+            
+        if time.perf_counter() - last_draw >= 1.0:
+            last_draw = time.perf_counter()
+            
+            points_to_process = None
+            with state.lock:
+                if len(state.point_buffer) > 1000:
+                    use_count = min(len(state.point_buffer), MAX_BUFFER_SIZE_2D)
+                    recent_points = list(state.point_buffer)[-use_count:]
+                    points_to_process = np.array(recent_points, dtype=np.float64) / 1000.0
+                    state.point_buffer.clear() 
+            
+            if points_to_process is not None:
+                grid_status = analyze_radar_logic(points_to_process)
+                instant_scores = np.zeros(ANGLE_SECTORS)
+
+                for rid in range(len(bars_layers)):
+                    bars = bars_layers[rid]
+                    for tid, bar in enumerate(bars):
+                        status = grid_status.get((rid, tid), -1)
+                        if status == 2:   # 赤
+                            bar.set_facecolor(COLOR_DANGER)
+                            instant_scores[tid] -= 5
+                        elif status == 1: # 黄
+                            bar.set_facecolor(COLOR_WALL)
+                            instant_scores[tid] -= 2
+                        elif status == 0: # 水色
+                            bar.set_facecolor(COLOR_SAFE)
+                            instant_scores[tid] += 1
+                        else:
+                            bar.set_facecolor(COLOR_EMPTY)
+                            instant_scores[tid] -= 0.5
+                
+                state.smoothed_scores = 0.85 * state.smoothed_scores + 0.15 * instant_scores
+
+                sector_distances = []
+                for tid in range(ANGLE_SECTORS):
+                    if grid_status.get((0, tid), 0) >= 1:
+                        sector_distances.append(0.0)
+                        continue
+                    dist = MAX_RADIUS
+                    for rid in range(num_rings):
+                        status = grid_status.get((rid, tid), 0)
+                        if status >= 1:
+                            dist = MIN_RADIUS + rid * RADIUS_STEP
+                            break
+                    sector_distances.append(dist)
+                
+                max_dist = max(sector_distances)
+                if max_dist > 0.0:
+                    candidates = [t for t, d in enumerate(sector_distances) if d == max_dist]
+                    best_tid = max(candidates, key=lambda t: state.smoothed_scores[t])
+                    best_angle = plot_thetas[best_tid]
+                    arrow_patch.xy = (best_angle, max_dist)
+                    arrow_patch.set_visible(True)
+                else:
+                    arrow_patch.set_visible(False)
+                
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+        
+        plt.pause(0.1)
+
+# --- 3Dモード (白点群・ズームアウト) ---
+def run_3d_mode():
+    print(">>> 3D Point Cloud Mode (Press 'v' to return to 2D) <<<")
+    
+    with state.lock:
+        current_data = list(state.point_buffer)
+        if len(current_data) > MAX_BUFFER_SIZE_3D:
+            current_data = current_data[-MAX_BUFFER_SIZE_3D:]
+        state.point_buffer = deque(current_data, maxlen=MAX_BUFFER_SIZE_3D)
+
+    vis = o3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(window_name="3D White Viewer (Wide)", width=960, height=720)
+    
+    pcd = o3d.geometry.PointCloud()
+    # 初期点を少し広めに配置してViewを安定させるハック
+    pcd.points = o3d.utility.Vector3dVector(np.array([[0,0,0], [2,2,2], [-2,-2,0]], dtype=np.float64))
+    vis.add_geometry(pcd)
+    vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5))
+
+    # ★ 視点コントロール: ズームアウト (縮小)
+    ctr = vis.get_view_control()
+    ctr.set_zoom(0.2) # 小さい値ほど引いた視点になる(デフォルトは0.8~1.0くらい)
+
+    opt = vis.get_render_option()
+    opt.background_color = np.asarray([0, 0, 0])
+    opt.point_size = POINT_SIZE_3D
+    opt.point_color_option = o3d.visualization.PointColorOption.Color 
+    
+    def key_v(vis):
+        state.switch_requested = True
+        vis.close()
+        return False
+    
+    def key_q(vis):
+        state.running = False
+        vis.close()
+        return False
+        
+    vis.register_key_callback(ord("V"), key_v)
+    vis.register_key_callback(ord("Q"), key_q)
+    
+    frame_count = 0
+    
+    while state.running and not state.switch_requested:
+        frame_count += 1
+        
+        if frame_count % 5 == 0:
+            points_to_process = None
+            with state.lock:
+                if len(state.point_buffer) > 0:
+                    points_to_process = np.array(state.point_buffer, dtype=np.float64) / 1000.0
+            
+            if points_to_process is not None:
+                pcd.points = o3d.utility.Vector3dVector(points_to_process)
+                pcd.paint_uniform_color([1, 1, 1]) 
+                vis.update_geometry(pcd)
+        
+        vis.poll_events()
+        vis.update_renderer()
+        if not vis.poll_events(): break
+        
+    vis.destroy_window()
+
+def main():
+    t = threading.Thread(target=udp_receiver, daemon=True)
+    t.start()
+    
+    try:
+        while state.running:
+            state.switch_requested = False
+            if state.mode == '2D':
+                run_2d_mode()
+                if state.switch_requested: state.mode = '3D'
+            else:
+                if HAS_OPEN3D:
+                    run_3d_mode()
+                    if state.switch_requested: state.mode = '2D'
+                else:
+                    state.mode = '2D'
+            time.sleep(0.5)
+            
+    except KeyboardInterrupt: pass
+    finally:
+        state.running = False
+        print("終了しました")
+
+if __name__ == "__main__": main()
